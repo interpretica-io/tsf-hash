@@ -71,7 +71,7 @@ which needs output channels, and only that factory has them.
 te_string digest = TE_STRING_INIT;
 
 if (!tapi_hash_available(factory, 10000))
-    TEST_SKIP("There is no python3 on the agent to hash with");
+    TEST_SKIP("There is no openssl on the agent to hash with");
 CHECK_RC(tapi_hash_compute(factory, TAPI_HASH_SHA256,
                            "secret", 6, NULL, 0, 10000, &digest));
 ```
@@ -79,35 +79,43 @@ CHECK_RC(tapi_hash_compute(factory, TAPI_HASH_SHA256,
 ## Everything runs on the agent
 
 The same shape as tsf-smb: the digest is computed and the cracker is
-driven on a Test Agent behind a job factory, and only what a tool
-printed is read back. A digest of a few algorithms could be done in the
-engine, but a cracker cannot, and keeping both on the agent means one
-code path and one place the work happens.
+driven on a Test Agent behind a job factory with stock tools, and only
+what a tool printed is read back. A digest of a few algorithms could be
+done in the engine, but a cracker cannot, and keeping both on the agent
+means one code path and one place the work happens. The two things that
+need no tool at all — CRC32 and identifying a hash from its shape — are
+done in C in the library.
 
-Nothing secret goes on the command line. A message to hash, a guessed
-password and a wordlist are files the caller wrote, and the tool is
-pointed at the file — what is on `argv` is visible to anyone running
-`ps` on the agent. A recovered plaintext is read from the tool's own
-output file, never from `argv`, and never logged.
+Nothing secret goes on the command line. A message to hash is a
+binary-safe file the caller wrote; a password handed to `mkpasswd` or
+`argon2` is a file fed on standard input; a guessed password and a
+wordlist for a cracker are files too. What is on `argv` is visible to
+anyone running `ps` on the agent. A recovered plaintext is read from the
+tool's own output, never from `argv`, and never logged.
 
 ## The algorithms
 
-The breadth for a plain digest is a small `python3` helper on the agent
-(`hashlib`, `zlib` and `crypt`), for the same reason tsf-smb negotiates
-SMB with one: a helper reads far more algorithms than juggling
-`md5sum`, `sha256sum` and `openssl` would.
+No helper of our own: stock tools do the work, each checked before use.
 
-| Family | Algorithms |
-|---|---|
-| Fast digests | MD5, SHA-1, SHA-224/256/384/512, SHA3-256/512, BLAKE2b |
-| Checksum | CRC32 (recognised so it can be flagged, never a password hash) |
-| Windows | LM, NTLM |
-| Unix crypt(3) | DES crypt, MD5-crypt (`$1$`), bcrypt (`$2*$`), SHA-256/512 crypt (`$5$`/`$6$`), yescrypt (`$y$`) |
-| Key derivation | PBKDF2-HMAC-SHA256, scrypt, Argon2id |
+| Family | Algorithms | Computed by |
+|---|---|---|
+| Fast digests | MD5, SHA-1, SHA-224/256/384/512, SHA3-256/512, BLAKE2b | `openssl dgst` |
+| Checksum | CRC32 (recognised so it can be flagged, never a password hash) | in C, here |
+| Windows | NTLM | `openssl dgst -md4` (ASCII password) |
+| Unix crypt(3) | DES crypt, MD5-crypt (`$1$`), bcrypt (`$2*$`), SHA-256/512 crypt (`$5$`/`$6$`), yescrypt (`$y$`) | `mkpasswd -m <method>` |
+| Password hashing | Argon2id | `argon2` |
 
-`tapi_hash_identify()` reads a hash string the other way: a `$6$…` is a
-SHA-512 crypt and nothing else, while a bare 32 hex characters is MD5 or
-NTLM or an LM half, so it returns every candidate, not one answer.
+`tapi_hash_compute` covers the rows above. LM (compute), and PBKDF2 and
+scrypt (compute), are **not** produced here: LM has no safe stock
+producer, and the only stock CLI for the two KDFs would put the password
+on `argv`. All three are still first-class **cracking** targets, and all
+are still **identified** and judged by the audit — computing them is the
+only gap.
+
+`tapi_hash_identify()` reads a hash string the other way, in pure C: a
+`$6$…` is a SHA-512 crypt and nothing else, while a bare 32 hex
+characters is MD5 or NTLM or an LM half, so it returns every candidate,
+not one answer.
 
 ## The crackers, and no pretence
 
@@ -161,34 +169,37 @@ verdict stays stable and secret-free for `conf/trc.xml`.
 
 ## What was verified, and what was not
 
-**The digest/identify helper — validated locally.** The bundled `python3`
-helper was extracted from the built-in source and run: `md5("secret")`
-came back `5ebe2294ecd0e0f08eab7690d2a6ee69` (the known vector),
-SHA-256, SHA3-256, CRC32 and PBKDF2-HMAC-SHA256 all produced digests, and
-`identify` classified `$6$`, `$2b$` and the bare-hex lengths correctly.
-It has **not** yet been run through a Test Agent behind a job factory.
+**CRC32 and identify — verified in C.** CRC32 is computed here; its
+output was checked byte-for-byte against `zlib.crc32` for several inputs
+(`crc32("secret")` = `5ca2e8e5`, and the standard "quick brown fox"
+vector `414fa339`). `tapi_hash_identify()` is pure string inspection and
+needs no tool. All five source files compile clean under `-Wall
+-Wextra` against the TE headers.
 
-**NTLM and crypt(3) depend on the agent.** NTLM is `md4` of the UTF-16LE
-password, and a stock OpenSSL 3 build has dropped `md4` from `hashlib` —
-there the helper answers `unsupported` rather than a wrong hash. The
-crypt(3) schemes need the agent's `crypt` module, which Python 3.13
-removed; there they answer `unsupported` too. Cracking NTLM or a crypt
-hash does not go through the helper, so this limits only `tapi_hash_compute`.
+**The tool drivers — written from documented command lines, not yet run
+through an agent.** `openssl dgst` for the digests, `mkpasswd -m` for the
+crypt schemes, `argon2` for Argon2, and the hashcat/John/RainbowCrack
+drivers were written from each tool's documented invocation and output
+shape and compiled clean, but the agent-run verification is owed. The
+output parsers (openssl's `-r` "hash *file", `mkpasswd`'s bare hash,
+`argon2 -e`'s encoded string, hashcat's plaintext-only outfile, `john
+--show`, rcrack's result line) are the first place to check against a
+live tool, and the algorithm maps the first place to extend.
 
-**The crackers and the table lookup — written, not yet run.** The
-hashcat, John and RainbowCrack drivers were written from the tools'
-documented command lines and output shapes and compiled clean, but the
-agent-run verification is owed. The output parsers (hashcat's
-plaintext-only outfile, `john --show`'s `user:plaintext:…`, rcrack's
-result line) are the first place to check against a live tool, and the
-algorithm maps the first place to extend.
+**NTLM computation is best-effort.** NTLM is MD4 of the UTF-16LE
+password. The conversion here is the ASCII/Latin-1 one, and MD4 is legacy
+in OpenSSL 3, so `tapi_hash_compute` tries a plain `openssl dgst -md4`
+first and the `-provider legacy` form second — which also covers an
+OpenSSL 1.1 that has no `-provider` option. A non-ASCII password or an
+OpenSSL without MD4 at all is the limit. Cracking NTLM goes through
+hashcat/john and is unaffected.
 
 ## Scope
 
 - **Cracking spends real time and touches real credentials.** A crack
   attempt is bounded by the policy's time budget; without one it can run
   as long as the timeout allows. Give it a budget in an audit.
-- **The helper, hash files and output files are written on the agent**
+- **Message, password, hash and output files are written on the agent**
   and removed again, even when a call fails.
 - **A recovered secret is the caller's to hold.** The library returns it
   and never logs it; a test that keeps or prints it does so on its own.

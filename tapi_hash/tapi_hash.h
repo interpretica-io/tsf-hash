@@ -35,20 +35,22 @@
  *
  * @section tapi_hash_backends The tools, and no pretence
  *
- * The breadth of algorithms for a plain digest is a small @c python3
- * helper on the agent (@c hashlib and @c crypt), for the same reason
- * tsf-smb negotiates SMB with one: a helper reads far more algorithms
- * than juggling @c md5sum, @c sha256sum and @c openssl would. The
- * crackers are the real ones - @c hashcat and @c john - and the tables
- * are @c rcrack (RainbowCrack) and @c ophcrack. Each is asked whether
- * it is there before it is used; a capability a backend lacks is
- * refused with @c TE_EOPNOTSUPP, never quietly skipped.
+ * No helper of our own - stock tools on the agent do the work. A plain
+ * digest is @c openssl @c dgst, one tool for the whole digest set; a
+ * crypt(3) password scheme is @c mkpasswd (libcrypt), which covers DES,
+ * MD5, bcrypt, the SHA crypts and yescrypt with one output shape;
+ * Argon2 is @c argon2. CRC32 and the hash identifier are computed here
+ * in C, needing nothing on the agent. The crackers are the real ones -
+ * @c hashcat and @c john - and the tables are @c rcrack (RainbowCrack).
+ * Each tool is asked whether it is there before it is used; a
+ * capability nothing on the agent provides is refused with
+ * @c TE_EOPNOTSUPP, never quietly skipped.
  *
  * @code
  * te_string digest = TE_STRING_INIT;
  *
  * if (!tapi_hash_available(factory, 10000))
- *     TEST_SKIP("There is no python3 on the agent to hash with");
+ *     TEST_SKIP("There is no openssl on the agent to hash with");
  * CHECK_RC(tapi_hash_compute(factory, TAPI_HASH_SHA256,
  *                            "secret", 6, NULL, 0, 10000, &digest));
  * @endcode
@@ -159,12 +161,16 @@ typedef enum tapi_hash_class {
 #define TAPI_HASH_FEAT_RAINBOW  (1u << 5)
 
 /**
- * Is there a @c python3 on the agent to compute and identify with?
+ * Is there an @c openssl on the agent to compute digests with?
+ *
+ * @c openssl is what a plain digest needs; a crypt(3) scheme needs
+ * @c mkpasswd and Argon2 needs @c argon2 on top, and each is checked
+ * when it is used. Identifying a hash needs nothing - it is done here.
  *
  * @param factory       Job factory.
  * @param timeout_ms    Timeout, ms.
  *
- * @return @c true when the helper can run.
+ * @return @c true when @c openssl is there.
  */
 extern bool tapi_hash_available(tapi_job_factory_t *factory, int timeout_ms);
 

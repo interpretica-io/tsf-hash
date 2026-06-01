@@ -59,38 +59,45 @@ extern te_errno tapi_hash_sh(tapi_job_factory_t *factory, const char *program,
                              te_string *out, te_string *err, int *exit_code);
 
 /**
- * Run the bundled @c python3 helper with @p args.
+ * Run a tool with its standard input redirected from a file on the
+ * agent.
  *
- * The helper is put on the agent once per call under its temporary
- * directory and removed again. It is the breadth of algorithms for a
- * digest and the identifier for a hash string. A message it hashes is
- * passed as the path of a file the caller wrote, never on @c argv.
+ * This is how a secret reaches a tool that reads its input on stdin
+ * (@c mkpasswd, @c argon2) without being on @c argv: the caller writes
+ * it to a file and it is fed in as @c "< file". The redirection is done
+ * by a POSIX @c /bin/sh line, so @p infile and @p program are ordinary
+ * words in it, not the shell's own.
  *
  * @param[in]  factory      Job factory.
- * @param[in]  args         Arguments after the script path.
+ * @param[in]  program      Program name.
+ * @param[in]  args         Arguments after @c argv[0].
+ * @param[in]  infile       File on the agent to feed as standard input.
  * @param[in]  timeout_ms   Timeout, ms.
- * @param[out] out          Standard output.
+ * @param[out] out          Standard output, or @c NULL.
+ * @param[out] err          Standard error, or @c NULL.
  * @param[out] exit_code    Exit status, or @c NULL.
  *
  * @return Status code.
- * @retval TE_ENOSYS        There is no @c python3 on the agent.
  */
-extern te_errno tapi_hash_python(tapi_job_factory_t *factory,
-                                 const te_vec *args, int timeout_ms,
-                                 te_string *out, int *exit_code);
-
-/** The bundled helper's source, defined once in tapi_hash_cmd.c. */
-extern const char tapi_hash_helper_py[];
+extern te_errno tapi_hash_sh_infile(tapi_job_factory_t *factory,
+                                    const char *program, const te_vec *args,
+                                    const char *infile, int timeout_ms,
+                                    te_string *out, te_string *err,
+                                    int *exit_code);
 
 /** The agent a factory runs on, for putting files there. */
 extern const char *tapi_hash_factory_ta(tapi_job_factory_t *factory);
 
 /**
- * Write @p data to a fresh file under the agent's temporary directory.
+ * Write text to a fresh file under the agent's temporary directory.
+ *
+ * For the crackers' hash files and password files, which are text.
+ * Binary bytes go through tapi_hash_ta_bytes() instead, which does not
+ * stop at a NUL.
  *
  * @param[in]  factory      Job factory.
  * @param[in]  suffix       A suffix for the name, e.g. @c ".hash".
- * @param[in]  data         The bytes, or @c NULL for an empty file.
+ * @param[in]  data         The text, or @c NULL for an empty file.
  * @param[out] path         String to put the created path in.
  *
  * @return Status code.
@@ -98,6 +105,25 @@ extern const char *tapi_hash_factory_ta(tapi_job_factory_t *factory);
 extern te_errno tapi_hash_ta_file(tapi_job_factory_t *factory,
                                   const char *suffix, const te_string *data,
                                   te_string *path);
+
+/**
+ * Write raw bytes to a fresh file under the agent's temporary directory.
+ *
+ * Binary-safe, unlike tapi_hash_ta_file(): the bytes go to a local file
+ * on the engine and are copied to the agent, so an embedded NUL is kept.
+ * This is what a message being hashed is written with.
+ *
+ * @param[in]  factory      Job factory.
+ * @param[in]  suffix       A suffix for the name.
+ * @param[in]  data         The bytes (may be @c NULL when @p len is 0).
+ * @param[in]  len          How many bytes.
+ * @param[out] path         String to put the created agent path in.
+ *
+ * @return Status code.
+ */
+extern te_errno tapi_hash_ta_bytes(tapi_job_factory_t *factory,
+                                   const char *suffix, const void *data,
+                                   size_t len, te_string *path);
 
 /** Remove a file from the agent, ignoring a failure. */
 extern void tapi_hash_ta_unlink(tapi_job_factory_t *factory,

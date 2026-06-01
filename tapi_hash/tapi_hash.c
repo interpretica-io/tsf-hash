@@ -3,15 +3,23 @@
 /** @file
  * @brief Hashing: algorithms, computing a digest, identifying one
  *
- * The breadth of algorithms is the bundled @c python3 helper, run on
- * the agent. A message to hash is written to a file on the agent and
- * the helper is pointed at it, so nothing being hashed is on @c argv.
+ * No helper of our own: stock tools on the agent do the work. A plain
+ * digest is @c openssl @c dgst - one tool for the whole digest set; a
+ * crypt(3) password scheme is @c mkpasswd (libcrypt), which covers DES,
+ * MD5, bcrypt, the SHA crypts and yescrypt with one consistent output;
+ * Argon2 is the @c argon2 tool. CRC32 and the hash identifier are pure
+ * C here, needing nothing on the agent at all.
+ *
+ * A message to hash is a binary-safe file on the agent; a password to
+ * an @c mkpasswd or @c argon2 is a file fed on standard input. Neither
+ * is ever on @c argv.
  */
 
 #define TE_LGR_USER "TAPI HASH"
 
 #include "te_config.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #include "logger_api.h"
@@ -71,6 +79,41 @@ hash_desc(tapi_hash_alg alg)
     return NULL;
 }
 
+/** The openssl @c dgst spelling of a plain digest, or @c NULL. */
+static const char *
+hash_openssl_dgst(tapi_hash_alg alg)
+{
+    switch (alg)
+    {
+        case TAPI_HASH_MD5:      return "md5";
+        case TAPI_HASH_SHA1:     return "sha1";
+        case TAPI_HASH_SHA224:   return "sha224";
+        case TAPI_HASH_SHA256:   return "sha256";
+        case TAPI_HASH_SHA384:   return "sha384";
+        case TAPI_HASH_SHA512:   return "sha512";
+        case TAPI_HASH_SHA3_256: return "sha3-256";
+        case TAPI_HASH_SHA3_512: return "sha3-512";
+        case TAPI_HASH_BLAKE2B:  return "blake2b512";
+        default:                 return NULL;
+    }
+}
+
+/** The mkpasswd @c -m method for a crypt(3) scheme, or @c NULL. */
+static const char *
+hash_mkpasswd_method(tapi_hash_alg alg)
+{
+    switch (alg)
+    {
+        case TAPI_HASH_DESCRYPT:    return "descrypt";
+        case TAPI_HASH_MD5CRYPT:    return "md5crypt";
+        case TAPI_HASH_BCRYPT:      return "bcrypt";
+        case TAPI_HASH_SHA256CRYPT: return "sha256crypt";
+        case TAPI_HASH_SHA512CRYPT: return "sha512crypt";
+        case TAPI_HASH_YESCRYPT:    return "yescrypt";
+        default:                    return NULL;
+    }
+}
+
 /* See description in tapi_hash.h */
 const char *
 tapi_hash_alg2str(tapi_hash_alg alg)
@@ -95,15 +138,12 @@ tapi_hash_str2alg(const char *name)
             return hash_algs[i].alg;
     }
 
-    /* A few aliases the tools use. */
     if (strcasecmp(name, "sha-1") == 0)
         return TAPI_HASH_SHA1;
     if (strcasecmp(name, "sha-256") == 0)
         return TAPI_HASH_SHA256;
     if (strcasecmp(name, "sha-512") == 0)
         return TAPI_HASH_SHA512;
-    if (strcasecmp(name, "md5crypt") == 0 || strcasecmp(name, "md5-crypt") == 0)
-        return TAPI_HASH_MD5CRYPT;
     if (strcasecmp(name, "argon2id") == 0)
         return TAPI_HASH_ARGON2;
 
@@ -123,28 +163,140 @@ tapi_hash_alg_class(tapi_hash_alg alg)
 bool
 tapi_hash_available(tapi_job_factory_t *factory, int timeout_ms)
 {
-    return tapi_hash_have_tool(factory, "python3", timeout_ms);
+    /* openssl is what a plain digest needs; the schemes add their own. */
+    return tapi_hash_have_tool(factory, "openssl", timeout_ms);
 }
 
-/** Read the "hash <value>" line the helper printed. */
-static te_errno
-hash_read_result(const char *out, te_string *hash)
+/** CRC32 (IEEE 802.3 / zlib polynomial), computed here on the engine. */
+static uint32_t
+hash_crc32(const unsigned char *p, size_t n)
 {
-    const char *line = strstr(out, "hash ");
+    uint32_t crc = 0xffffffffu;
+    size_t i;
+    int k;
 
-    if (line != NULL && (line == out || line[-1] == '\n'))
+    for (i = 0; i < n; i++)
     {
-        const char *v = line + strlen("hash ");
-        size_t n = strcspn(v, "\r\n");
+        crc ^= p[i];
+        for (k = 0; k < 8; k++)
+            crc = (crc >> 1) ^ (0xedb88320u & (uint32_t)(-(int32_t)(crc & 1)));
+    }
 
-        te_string_append(hash, "%.*s", (int)n, v);
+    return crc ^ 0xffffffffu;
+}
+
+/** Take the first whitespace-delimited token of @p text into @p dest. */
+static bool
+hash_first_token(const char *text, te_string *dest)
+{
+    size_t n;
+
+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n')
+        text++;
+    n = strcspn(text, " \t\r\n");
+    if (n == 0)
+        return false;
+
+    te_string_append(dest, "%.*s", (int)n, text);
+    return true;
+}
+
+/** Run "openssl dgst" over @p msg_file, optionally loading the legacy provider. */
+static te_errno
+hash_openssl_run(tapi_job_factory_t *factory, const char *ossl,
+                 bool legacy, const char *msg_file, int timeout_ms,
+                 te_string *hash)
+{
+    te_vec args = TE_VEC_INIT(char *);
+    te_string out = TE_STRING_INIT;
+    int code = 0;
+    te_errno rc;
+
+    tapi_hash_arg(&args, "dgst");
+    if (legacy)
+    {
+        tapi_hash_arg(&args, "-provider");
+        tapi_hash_arg(&args, "legacy");
+        tapi_hash_arg(&args, "-provider");
+        tapi_hash_arg(&args, "default");
+    }
+    tapi_hash_arg(&args, "-%s", ossl);
+    tapi_hash_arg(&args, "-r");
+    tapi_hash_arg(&args, "%s", msg_file);
+
+    rc = tapi_hash_sh(factory, "openssl", &args, timeout_ms, &out, &out,
+                      &code);
+    if (rc == 0 && code == TAPI_HASH_EXIT_NOT_FOUND)
+        rc = TE_RC(TE_TAPI, TE_ENOSYS);
+    else if (rc == 0 && code != 0)
+        rc = TE_RC(TE_TAPI, TE_EFAIL);
+    else if (rc == 0 && !hash_first_token(te_string_value(&out), hash))
+        rc = TE_RC(TE_TAPI, TE_EPROTO);
+
+    te_vec_deep_free(&args);
+    te_string_free(&out);
+
+    return rc;
+}
+
+/** Compute a plain digest (openssl), NTLM (openssl md4) or CRC32 (here). */
+static te_errno
+hash_compute_digest(tapi_job_factory_t *factory, tapi_hash_alg alg,
+                    const void *data, size_t len, int timeout_ms,
+                    te_string *hash)
+{
+    te_string msg_file = TE_STRING_INIT;
+    te_errno rc;
+
+    if (alg == TAPI_HASH_CRC32)
+    {
+        te_string_append(hash, "%08x", hash_crc32(data, len));
         return 0;
     }
 
-    if (strstr(out, "unsupported ") != NULL)
-        return TE_RC(TE_TAPI, TE_EOPNOTSUPP);
+    if (alg == TAPI_HASH_NTLM)
+    {
+        /*
+         * NTLM is MD4 of the UTF-16LE password. The conversion here is
+         * the ASCII/Latin-1 one (each byte, then a zero byte); a
+         * non-ASCII password would need a real UTF-8 to UTF-16LE step.
+         * MD4 is legacy in OpenSSL 3, so the plain run is tried first
+         * and the legacy provider only if it fails - which also works
+         * on an OpenSSL 1.1 that has no -provider option.
+         */
+        unsigned char *u16 = TE_ALLOC(len * 2 + 1);
+        size_t i;
 
-    return TE_RC(TE_TAPI, TE_EPROTO);
+        for (i = 0; i < len; i++)
+            u16[i * 2] = ((const unsigned char *)data)[i];
+
+        rc = tapi_hash_ta_bytes(factory, "-ntlm", u16, len * 2, &msg_file);
+        free(u16);
+        if (rc == 0)
+        {
+            rc = hash_openssl_run(factory, "md4", false, msg_file.ptr,
+                                  timeout_ms, hash);
+            if (rc != 0 && TE_RC_GET_ERROR(rc) != TE_ENOSYS)
+            {
+                te_string_reset(hash);
+                rc = hash_openssl_run(factory, "md4", true, msg_file.ptr,
+                                      timeout_ms, hash);
+            }
+        }
+        tapi_hash_ta_unlink(factory, msg_file.ptr);
+        return rc;
+    }
+
+    /* A plain digest through openssl dgst. */
+    rc = tapi_hash_ta_bytes(factory, "-hashmsg", data, len, &msg_file);
+    if (rc == 0)
+    {
+        rc = hash_openssl_run(factory, hash_openssl_dgst(alg), false,
+                              msg_file.ptr, timeout_ms, hash);
+    }
+    tapi_hash_ta_unlink(factory, msg_file.ptr);
+
+    return rc;
 }
 
 /* See description in tapi_hash.h */
@@ -154,11 +306,11 @@ tapi_hash_compute(tapi_job_factory_t *factory, tapi_hash_alg alg,
                   size_t salt_len, int timeout_ms, te_string *hash)
 {
     const hash_alg_desc *d = hash_desc(alg);
-    te_vec args = TE_VEC_INIT(char *);
-    te_string msg_hex = TE_STRING_INIT;
-    te_string msg_file = TE_STRING_INIT;
-    te_string salt_arg = TE_STRING_INIT;
+    const char *method;
+    te_string pw = TE_STRING_INIT;
+    te_string pw_file = TE_STRING_INIT;
     te_string out = TE_STRING_INIT;
+    te_vec args = TE_VEC_INIT(char *);
     int code = 0;
     te_errno rc;
 
@@ -168,39 +320,66 @@ tapi_hash_compute(tapi_job_factory_t *factory, tapi_hash_alg alg,
         return TE_RC(TE_TAPI, TE_EINVAL);
     }
 
-    /* The message goes to a file, hex-encoded, never on argv. */
-    tapi_hash_hex(&msg_hex, data, len);
-    rc = tapi_hash_ta_file(factory, "-hashmsg", &msg_hex, &msg_file);
+    /* Digests, NTLM and CRC32. */
+    if (d->is_digest || alg == TAPI_HASH_NTLM)
+        return hash_compute_digest(factory, alg, data, len, timeout_ms, hash);
+
+    method = hash_mkpasswd_method(alg);
+    if (method == NULL && alg != TAPI_HASH_ARGON2)
+    {
+        /*
+         * PBKDF2 and scrypt have no stock CLI that takes the password
+         * off argv, so computing them is refused rather than leaking
+         * it; they are still crackable through hashcat/john.
+         */
+        ERROR("Computing %s without a helper is not supported; "
+              "it can still be cracked", d->name);
+        return TE_RC(TE_TAPI, TE_EOPNOTSUPP);
+    }
+
+    /* The password is a file fed on stdin, never on argv. */
+    te_string_append(&pw, "%.*s", (int)len, (const char *)data);
+    rc = tapi_hash_ta_file(factory, "-pw", &pw, &pw_file);
     if (rc != 0)
         goto out;
 
-    tapi_hash_arg(&args, "compute");
-    tapi_hash_arg(&args, "%s", d->name);
-    tapi_hash_arg(&args, "%s", msg_file.ptr);
-    if (salt != NULL)
+    if (method != NULL)
     {
-        /*
-         * A KDF wants raw salt bytes, so they go as hex; a crypt(3)
-         * scheme wants a setting string, so it goes verbatim.
-         */
-        if (alg == TAPI_HASH_PBKDF2_SHA256 || alg == TAPI_HASH_SCRYPT)
-            tapi_hash_hex(&salt_arg, salt, salt_len);
+        tapi_hash_arg(&args, "-m");
+        tapi_hash_arg(&args, "%s", method);
+        if (salt != NULL)
+        {
+            tapi_hash_arg(&args, "-S");
+            tapi_hash_arg(&args, "%.*s", (int)salt_len, (const char *)salt);
+        }
+        rc = tapi_hash_sh_infile(factory, "mkpasswd", &args, pw_file.ptr,
+                                 timeout_ms, &out, &out, &code);
+    }
+    else
+    {
+        /* argon2 <salt> -id -e : salt is a positional, min 8 bytes. */
+        if (salt != NULL && salt_len >= 8)
+            tapi_hash_arg(&args, "%.*s", (int)salt_len, (const char *)salt);
         else
-            te_string_append(&salt_arg, "%.*s", (int)salt_len,
-                             (const char *)salt);
-        tapi_hash_arg(&args, "%s", salt_arg.ptr);
+            tapi_hash_arg(&args, "tsfhashsalt");
+        tapi_hash_arg(&args, "-id");
+        tapi_hash_arg(&args, "-e");
+        rc = tapi_hash_sh_infile(factory, "argon2", &args, pw_file.ptr,
+                                 timeout_ms, &out, &out, &code);
     }
 
-    rc = tapi_hash_python(factory, &args, timeout_ms, &out, &code);
-    if (rc == 0)
-        rc = hash_read_result(te_string_value(&out), hash);
+    if (rc == 0 && code == TAPI_HASH_EXIT_NOT_FOUND)
+        rc = TE_RC(TE_TAPI, TE_ENOSYS);
+    else if (rc == 0 && code != 0)
+        rc = TE_RC(TE_TAPI, TE_EFAIL);
+    else if (rc == 0 && !hash_first_token(te_string_value(&out), hash))
+        rc = TE_RC(TE_TAPI, TE_EPROTO);
 
 out:
-    tapi_hash_ta_unlink(factory, msg_file.ptr);
+    tapi_hash_ta_unlink(factory, pw_file.ptr);
     te_vec_deep_free(&args);
-    te_string_free(&msg_hex);
-    te_string_free(&msg_file);
-    te_string_free(&salt_arg);
+    te_string_free(&pw);
+    te_string_free(&pw_file);
     te_string_free(&out);
 
     return rc;
@@ -211,55 +390,44 @@ te_errno
 tapi_hash_compute_file(tapi_job_factory_t *factory, tapi_hash_alg alg,
                        const char *path, int timeout_ms, te_string *hash)
 {
-    const hash_alg_desc *d = hash_desc(alg);
-    te_vec args = TE_VEC_INIT(char *);
-    te_string out = TE_STRING_INIT;
-    int code = 0;
-    te_errno rc;
+    const char *ossl = hash_openssl_dgst(alg);
 
-    if (d == NULL || !d->is_digest)
+    if (alg == TAPI_HASH_CRC32)
+    {
+        ERROR("CRC32 of a file on the agent is not supported here");
+        return TE_RC(TE_TAPI, TE_EOPNOTSUPP);
+    }
+    if (ossl == NULL)
     {
         ERROR("%s is not a plain digest a file can be hashed with",
               tapi_hash_alg2str(alg));
         return TE_RC(TE_TAPI, TE_EINVAL);
     }
 
-    /*
-     * The helper reads the message as a hex file; a raw file is hashed
-     * by pointing the helper at a small wrapper is overkill, so this
-     * uses the stock digesting tools instead when they are the exact
-     * algorithm, falling back to nothing for the SHA-3/BLAKE2 family a
-     * bare coreutils may lack. For a first cut it drives openssl, which
-     * covers the whole digest set on one command.
-     */
-    tapi_hash_arg(&args, "dgst");
-    tapi_hash_arg(&args, "-%s", d->name);
-    tapi_hash_arg(&args, "-r");
-    tapi_hash_arg(&args, "%s", path);
+    return hash_openssl_run(factory, ossl, false, path, timeout_ms, hash);
+}
 
-    rc = tapi_hash_sh(factory, "openssl", &args, timeout_ms, &out, &out,
-                      &code);
-    if (rc == 0 && code == TAPI_HASH_EXIT_NOT_FOUND)
-        rc = TE_RC(TE_TAPI, TE_ENOSYS);
-    if (rc == 0 && code == 0)
-    {
-        const char *text = te_string_value(&out);
-        size_t n = strcspn(text, " \t\r\n");
+/** Is @p s non-empty and all hex? */
+static bool
+hash_is_hex(const char *s)
+{
+    if (s == NULL || *s == '\0')
+        return false;
 
-        if (n == 0)
-            rc = TE_RC(TE_TAPI, TE_EPROTO);
-        else
-            te_string_append(hash, "%.*s", (int)n, text);
-    }
-    else if (rc == 0)
+    for (; *s != '\0'; s++)
     {
-        rc = TE_RC(TE_TAPI, TE_EFAIL);
+        if (strchr("0123456789abcdefABCDEF", *s) == NULL)
+            return false;
     }
 
-    te_vec_deep_free(&args);
-    te_string_free(&out);
+    return true;
+}
 
-    return rc;
+/** Append an algorithm to the candidate vector. */
+static void
+hash_add(te_vec *algs, tapi_hash_alg alg)
+{
+    TE_VEC_APPEND(algs, alg);
 }
 
 /* See description in tapi_hash.h */
@@ -267,43 +435,61 @@ te_errno
 tapi_hash_identify(tapi_job_factory_t *factory, const char *hash,
                    int timeout_ms, te_vec *algs)
 {
-    te_vec args = TE_VEC_INIT(char *);
-    te_string out = TE_STRING_INIT;
-    const char *line;
-    int code = 0;
-    te_errno rc;
+    UNUSED(factory);
+    UNUSED(timeout_ms);
 
     if (hash == NULL || algs == NULL)
         return TE_RC(TE_TAPI, TE_EINVAL);
 
-    tapi_hash_arg(&args, "identify");
-    tapi_hash_arg(&args, "%s", hash);
-
-    rc = tapi_hash_python(factory, &args, timeout_ms, &out, &code);
-    if (rc != 0)
-        goto out;
-
-    for (line = te_string_value(&out); line != NULL && *line != '\0'; )
+    if (strncmp(hash, "$6$", 3) == 0)
+        hash_add(algs, TAPI_HASH_SHA512CRYPT);
+    else if (strncmp(hash, "$5$", 3) == 0)
+        hash_add(algs, TAPI_HASH_SHA256CRYPT);
+    else if (strncmp(hash, "$1$", 3) == 0)
+        hash_add(algs, TAPI_HASH_MD5CRYPT);
+    else if (strncmp(hash, "$2a$", 4) == 0 || strncmp(hash, "$2b$", 4) == 0 ||
+             strncmp(hash, "$2y$", 4) == 0)
+        hash_add(algs, TAPI_HASH_BCRYPT);
+    else if (strncmp(hash, "$y$", 3) == 0)
+        hash_add(algs, TAPI_HASH_YESCRYPT);
+    else if (strncmp(hash, "$argon2", 7) == 0)
+        hash_add(algs, TAPI_HASH_ARGON2);
+    else if (strncmp(hash, "$scrypt$", 8) == 0)
+        hash_add(algs, TAPI_HASH_SCRYPT);
+    else if (hash_is_hex(hash))
     {
-        if (strncmp(line, "alg ", 4) == 0)
+        switch (strlen(hash))
         {
-            char name[64] = "";
-            tapi_hash_alg alg;
-
-            sscanf(line + 4, "%63[^\r\n]", name);
-            alg = tapi_hash_str2alg(name);
-            if (alg != TAPI_HASH_NONE)
-                TE_VEC_APPEND(algs, alg);
+            case 8:
+                hash_add(algs, TAPI_HASH_CRC32);
+                break;
+            case 32:
+                hash_add(algs, TAPI_HASH_MD5);
+                hash_add(algs, TAPI_HASH_NTLM);
+                hash_add(algs, TAPI_HASH_LM);
+                break;
+            case 40:
+                hash_add(algs, TAPI_HASH_SHA1);
+                break;
+            case 56:
+                hash_add(algs, TAPI_HASH_SHA224);
+                break;
+            case 64:
+                hash_add(algs, TAPI_HASH_SHA256);
+                hash_add(algs, TAPI_HASH_SHA3_256);
+                break;
+            case 96:
+                hash_add(algs, TAPI_HASH_SHA384);
+                break;
+            case 128:
+                hash_add(algs, TAPI_HASH_SHA512);
+                hash_add(algs, TAPI_HASH_SHA3_512);
+                hash_add(algs, TAPI_HASH_BLAKE2B);
+                break;
+            default:
+                break;
         }
-
-        line = strchr(line, '\n');
-        if (line != NULL)
-            line++;
     }
 
-out:
-    te_vec_deep_free(&args);
-    te_string_free(&out);
-
-    return rc;
+    return 0;
 }
