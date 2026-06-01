@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Interpretica Unipessoal Lda */
 /** @file
  * @brief Looking a hash up in a precomputed table
